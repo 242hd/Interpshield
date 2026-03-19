@@ -144,13 +144,26 @@ export default function App() {
   const [copyStatus, setCopyStatus] = useState<{[key: string]: boolean}>({});
   const [testStatus, setTestStatus] = useState<'idle' | 'testing' | 'success' | 'error'>('idle');
   const [testError, setTestError] = useState<string | null>(null);
+  const [dgTestStatus, setDgTestStatus] = useState<'idle' | 'testing' | 'success' | 'error'>('idle');
+  const [dgTestError, setDgTestError] = useState<string | null>(null);
 
   const transcriptEndRef = useRef<HTMLDivElement>(null);
   const translationEndRef = useRef<HTMLDivElement>(null);
   const speechServiceRef = useRef<DeepgramSpeechService | null>(null);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
 
-  const [geminiKey, setGeminiKey] = useState<string | null>(null);
+  const [geminiKey, setGeminiKey] = useState<string | null>(() => {
+    if (typeof window !== 'undefined') {
+      return localStorage.getItem('gemini_api_key');
+    }
+    return null;
+  });
+  const [deepgramKey, setDeepgramKey] = useState<string | null>(() => {
+    if (typeof window !== 'undefined') {
+      return localStorage.getItem('deepgram_api_key');
+    }
+    return null;
+  });
 
   // Timer logic
   useEffect(() => {
@@ -177,6 +190,9 @@ export default function App() {
         
         if (config.geminiApiKey && config.geminiApiKey !== 'null' && config.geminiApiKey !== 'undefined') {
           setGeminiKey(config.geminiApiKey);
+        }
+        if (config.deepgramApiKey && config.deepgramApiKey !== 'null' && config.deepgramApiKey !== 'undefined') {
+          setDeepgramKey(config.deepgramApiKey);
         }
       } catch (e) {
         console.error('❌ Failed to fetch config:', e);
@@ -324,6 +340,36 @@ export default function App() {
     }
   };
 
+  const handleTestDeepgram = async () => {
+    setDgTestStatus('testing');
+    setDgTestError(null);
+    try {
+      const keyToTest = deepgramKey || '';
+      if (!keyToTest || keyToTest.length < 10) {
+        setDgTestStatus('error');
+        setDgTestError('Invalid Deepgram key format');
+        return;
+      }
+
+      // Deepgram test: try to fetch project info
+      const response = await fetch('https://api.deepgram.com/v1/projects', {
+        headers: { 'Authorization': `Token ${keyToTest}` }
+      });
+      
+      if (response.ok) {
+        setDgTestStatus('success');
+        setTimeout(() => setDgTestStatus('idle'), 3000);
+      } else {
+        const data = await response.json().catch(() => ({}));
+        setDgTestStatus('error');
+        setDgTestError(data.err_msg || 'Deepgram key invalid or unauthorized');
+      }
+    } catch (e: any) {
+      setDgTestStatus('error');
+      setDgTestError(e.message || 'Network error');
+    }
+  };
+
   const handleStopSession = () => {
     if (speechServiceRef.current) {
       speechServiceRef.current.stop();
@@ -335,6 +381,16 @@ export default function App() {
     setIsMicActive(false);
     setVolume(0);
     setDetectedLang(null);
+  };
+
+  const handleSaveConfig = () => {
+    if (geminiKey) localStorage.setItem('gemini_api_key', geminiKey);
+    else localStorage.removeItem('gemini_api_key');
+    
+    if (deepgramKey) localStorage.setItem('deepgram_api_key', deepgramKey);
+    else localStorage.removeItem('deepgram_api_key');
+    
+    setShowConfigModal(false);
   };
 
   const handleStartSession = async () => {
@@ -393,7 +449,7 @@ export default function App() {
     // Fetch fresh config to get the key
     const res = await fetch('/api/config');
     const config = await res.json();
-    const dgKey = config.deepgramApiKey;
+    const dgKey = deepgramKey || config.deepgramApiKey;
     
     const options = {
       language: lang,
@@ -518,20 +574,44 @@ export default function App() {
                       <Mic className="w-4 h-4 text-brand" />
                       <span className="text-sm font-bold text-slate-300">Deepgram (Transcription)</span>
                     </div>
-                    <div className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider ${hasDeepgramKey ? 'bg-emerald-500/10 text-emerald-500 border border-emerald-500/20' : 'bg-amber-500/10 text-amber-500 border border-amber-500/20'}`}>
-                      {hasDeepgramKey ? 'Configured' : 'Fallback Active'}
+                    <div className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider ${hasDeepgramKey || deepgramKey ? 'bg-emerald-500/10 text-emerald-500 border border-emerald-500/20' : 'bg-amber-500/10 text-amber-500 border border-amber-500/20'}`}>
+                      {hasDeepgramKey || deepgramKey ? 'Configured' : 'Fallback Active'}
                     </div>
                   </div>
+                  <div className="relative">
+                    <input 
+                      type="password"
+                      value={deepgramKey || ''}
+                      onChange={(e) => {
+                        setDeepgramKey(e.target.value);
+                      }}
+                      placeholder="Enter Deepgram API Key..."
+                      className="w-full px-4 py-3 bg-slate-950 border border-slate-800 rounded-xl text-sm text-white placeholder:text-slate-600 focus:outline-none focus:border-brand/50 transition-all"
+                    />
+                    <Key className="absolute right-4 top-3.5 w-4 h-4 text-slate-600" />
+                  </div>
                   <p className="text-[10px] text-slate-500 leading-relaxed">
-                    {hasDeepgramKey 
-                      ? "Using high-performance Deepgram transcription." 
-                      : "Deepgram key missing. Using browser-native speech recognition as fallback."}
+                    Used for high-performance real-time transcription. If not provided, browser-native speech recognition will be used as fallback.
                   </p>
+                  <button 
+                    onClick={handleTestDeepgram}
+                    disabled={dgTestStatus === 'testing' || (!deepgramKey && !hasDeepgramKey)}
+                    className={`text-[10px] font-bold uppercase tracking-wider px-3 py-1.5 rounded-lg border transition-all ${
+                      dgTestStatus === 'success' ? 'bg-emerald-500/10 text-emerald-500 border-emerald-500/20' :
+                      dgTestStatus === 'error' ? 'bg-red-500/10 text-red-500 border-red-500/20' :
+                      'bg-slate-800 text-slate-400 border-slate-700 hover:text-white hover:bg-slate-700'
+                    }`}
+                  >
+                    {dgTestStatus === 'testing' ? 'Testing...' : 
+                     dgTestStatus === 'success' ? 'Connection OK!' : 
+                     dgTestStatus === 'error' ? 'Test Failed' : 'Test Connection'}
+                  </button>
+                  {dgTestError && <p className="text-[10px] text-red-500 mt-1">{dgTestError}</p>}
                 </div>
 
                 <div className="pt-4 border-t border-slate-800">
                   <button 
-                    onClick={() => setShowConfigModal(false)}
+                    onClick={handleSaveConfig}
                     className="w-full py-3 bg-brand hover:bg-brand-dark text-white rounded-xl font-bold text-sm transition-all shadow-lg shadow-brand/20"
                   >
                     Save & Close

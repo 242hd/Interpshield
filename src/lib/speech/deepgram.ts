@@ -51,6 +51,8 @@ export class DeepgramSpeechService {
   private animationFrame: number | null = null;
   private currentStream: MediaStream | null = null;
   private firstChunkSent = false;
+  private keepAliveInterval: any = null;
+  private isStopping = false;
   
   // Metrics
   private startTime: number = 0;
@@ -107,6 +109,7 @@ export class DeepgramSpeechService {
   }
 
   async start() {
+    this.isStopping = false;
     if (this.currentStream) {
       return this.connectToDeepgram(this.currentStream);
     }
@@ -241,52 +244,42 @@ export class DeepgramSpeechService {
       this.source.connect(this.processor);
       this.processor.connect(this.audioContext.destination);
 
-      // --- STEP 2: Wait for the first audio chunk ---
-      console.log('⏳ [Deepgram] 2. Waiting for first audio chunk from microphone...');
+      // --- STEP 2: Setup Audio Processing ---
+      console.log('⚙️ [Deepgram] 2. Setting up audio processing...');
       
-      const firstChunkPromise = new Promise<ArrayBuffer>((resolve) => {
-        if (!this.processor) return;
-        this.processor.onaudioprocess = (e) => {
-          const inputData = e.inputBuffer.getChannelData(0);
-          const pcmData = new Int16Array(inputData.length);
-          let hasData = false;
+      if (!this.processor) return;
+      this.processor.onaudioprocess = (e) => {
+        const inputData = e.inputBuffer.getChannelData(0);
+        const pcmData = new Int16Array(inputData.length);
+        let hasData = false;
+        
+        for (let i = 0; i < inputData.length; i++) {
+          const s = Math.max(-1, Math.min(1, inputData[i]));
+          pcmData[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+          if (pcmData[i] !== 0) hasData = true;
+        }
+
+        if (hasData || this.socket?.readyState === 1) {
+          const buffer = pcmData.buffer.slice(0);
           
-          for (let i = 0; i < inputData.length; i++) {
-            const s = Math.max(-1, Math.min(1, inputData[i]));
-            pcmData[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-            if (pcmData[i] !== 0) hasData = true;
-          }
-
-          if (hasData) {
-            const buffer = pcmData.buffer.slice(0);
-            
-            // If this is the very first chunk, resolve the promise
-            if (!this.firstChunkSent && !this.socket) {
-              console.log('📦 [Deepgram] 3. First audio chunk captured and buffered');
-              resolve(buffer);
+          // If socket is open, send data
+          if (this.socket?.readyState === 1 && !this.isPaused) {
+            this.socket.send(pcmData.buffer);
+            const now = Date.now();
+            if (!this.firstChunkSent) {
+              console.log('📤 [Deepgram] 4. First audio chunk sent to WebSocket');
+              this.firstChunkSent = true;
             }
-
-            // If socket is open, send data
-            if (this.socket?.readyState === 1 && !this.isPaused) {
-              this.socket.send(pcmData.buffer);
-              const now = Date.now();
-              if (!this.firstChunkSent) {
-                console.log('📤 [Deepgram] 6. First audio chunk sent to WebSocket');
-                this.firstChunkSent = true;
-              }
-              this.updateDebug({ 
-                chunksSent: this.debugInfo.chunksSent + 1,
-                lastChunkTimestamp: now
-              });
-            }
+            this.updateDebug({ 
+              chunksSent: this.debugInfo.chunksSent + 1,
+              lastChunkTimestamp: now
+            });
           }
-        };
-      });
-
-      const firstChunk = await firstChunkPromise;
+        }
+      };
 
       // --- STEP 3: Open WebSocket connection ---
-      console.log('🛰️ [Deepgram] 4. Opening WebSocket connection...');
+      console.log('🛰️ [Deepgram] 3. Opening WebSocket connection...');
       const lang = this.options.language || 'en';
       const detect = this.options.detectLanguage ? '&detect_language=true' : `&language=${lang}`;
       const url = `wss://api.deepgram.com/v1/listen?model=nova-2&encoding=linear16&sample_rate=16000&interim_results=true&punctuate=true&endpointing=300${detect}`;
@@ -297,7 +290,7 @@ export class DeepgramSpeechService {
       this.socket.onopen = () => {
         this.connectTime = Date.now();
         const latency = this.connectTime - this.startTime;
-        console.log(`📡 [Deepgram] 5. WebSocket connected (Latency: ${latency}ms)`);
+        console.log(`📡 [Deepgram] 4. WebSocket connected (Latency: ${latency}ms)`);
         
         this.updateDebug({ 
           socketConnected: true,
@@ -305,20 +298,10 @@ export class DeepgramSpeechService {
         });
         
         this.options.onStatusChange('deepgram_connected');
-
-        // Immediately send the buffered first chunk
-        if (this.socket?.readyState === 1) {
-          this.socket.send(firstChunk);
-          this.firstChunkSent = true;
-          const now = Date.now();
-          console.log('📤 [Deepgram] 6. Immediate buffered chunk sent on open');
-          this.updateDebug({ 
-            chunksSent: this.debugInfo.chunksSent + 1,
-            lastChunkTimestamp: now
-          });
-        }
-
         this.options.onStatusChange('listening');
+
+        // Start keep-alive heartbeat
+        this.startKeepAlive();
       };
 
       this.socket.onmessage = (message) => {
@@ -374,17 +357,43 @@ export class DeepgramSpeechService {
       this.socket.onclose = (event) => {
         console.log('📡 [Deepgram] WebSocket connection closed. Code:', event.code, 'Reason:', event.reason || 'No reason provided');
         this.updateDebug({ socketConnected: false });
+        this.stopKeepAlive();
         
-        if (event.code !== 1000) {
-          const msg = `Deepgram closed: ${event.reason || 'Unknown reason'}`;
+        if (event.code !== 1000 && !this.isStopping) {
+          console.log('🔄 [Deepgram] Unexpected closure, attempting to reconnect...');
+          const msg = `Deepgram closed: ${event.reason || 'Timeout'}. Reconnecting...`;
           this.updateDebug({ lastError: msg });
-          this.options.onError(msg);
+          
+          // Attempt to reconnect after a short delay
+          setTimeout(() => {
+            if (!this.isStopping && this.currentStream) {
+              this.connectToDeepgram(this.currentStream);
+            }
+          }, 2000);
+        } else {
+          this.options.onStatusChange('idle');
         }
-        this.options.onStatusChange('idle');
       };
 
     } catch (error) {
       this.handleError(error);
+    }
+  }
+
+  private startKeepAlive() {
+    this.stopKeepAlive();
+    this.keepAliveInterval = setInterval(() => {
+      if (this.socket?.readyState === 1) {
+        // Deepgram expects a JSON string for keep-alive
+        this.socket.send(JSON.stringify({ type: 'KeepAlive' }));
+      }
+    }, 5000); // Send every 5 seconds
+  }
+
+  private stopKeepAlive() {
+    if (this.keepAliveInterval) {
+      clearInterval(this.keepAliveInterval);
+      this.keepAliveInterval = null;
     }
   }
 
@@ -398,6 +407,7 @@ export class DeepgramSpeechService {
 
   stop() {
     console.log('🛑 [Deepgram] Stopping session...');
+    this.isStopping = true;
     
     if (this.animationFrame) {
       cancelAnimationFrame(this.animationFrame);
@@ -431,6 +441,7 @@ export class DeepgramSpeechService {
       this.socket = null;
     }
     
+    this.stopKeepAlive();
     this.options.onStatusChange('idle');
   }
 }
