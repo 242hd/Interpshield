@@ -1,0 +1,7 @@
+{
+  "name": "InterpShield.",
+  "description": "InterpShield MVP: Real-Time AI Interpretation & Translation interface with Deepgram and Gemini integration.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
